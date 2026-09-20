@@ -1,17 +1,36 @@
 version: '3.8'
 
 services:
-  embed-server:
-    build: .
-    container_name: img-text-embed-server
+  # Python FastAPI Server (PyTorch)
+  embed-server-python:
+    build:
+      context: ./python
+      dockerfile: Dockerfile
+    container_name: embed-server-python
     restart: unless-stopped
     ports:
       - "8000:8000"
     env_file:
-      - .env
+      - ./python/.env.example
     deploy:
       resources:
         limits:
           cpus: '1.0'
           memory: 1G
 
+  # Node.js Express Server (ONNX Runtime - Lightweight & Fast)
+  embed-server-js:
+    build:
+      context: ./js
+      dockerfile: Dockerfile
+    container_name: embed-server-js
+    restart: unless-stopped
+    ports:
+      - "8001:8001"
+    env_file:
+      - ./js/.env.example
+    deploy:
+      resources:
+        limits:
+          cpus: '1.0'
+          memory: 1G

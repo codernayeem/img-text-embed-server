@@ -1,6 +1,8 @@
 import os
 import io
 import time
+import gc
+import asyncio
 import hashlib
 import psutil
 from collections import deque
@@ -39,7 +41,10 @@ MODEL_NAME = os.getenv("MODEL_NAME", "openai/clip-vit-base-patch32")
 DEVICE = os.getenv("DEVICE", "cpu")
 DEFAULT_IMAGE_WEIGHT = float(os.getenv("IMAGE_WEIGHT", "0.6"))
 DEFAULT_TEXT_WEIGHT = float(os.getenv("TEXT_WEIGHT", "0.4"))
+
+# In-Memory Cache & History Limit
 HISTORY_LIMIT = int(os.getenv("HISTORY_LIMIT", "100"))
+IDLE_TIMEOUT_SECONDS = int(os.getenv("IDLE_TIMEOUT_MINUTES", "30")) * 60
 
 NUM_THREADS = int(os.getenv("NUM_THREADS", "0"))
 if NUM_THREADS > 0:
@@ -48,6 +53,7 @@ if NUM_THREADS > 0:
 
 # Server state
 SERVER_START_TIME = time.time()
+LAST_ACTIVITY_TIME = time.time()
 TOTAL_REQUESTS = 0
 CACHE_HITS = 0
 
@@ -56,14 +62,39 @@ history_deque: deque = deque(maxlen=HISTORY_LIMIT)
 history_lookup: Dict[str, Dict[str, Any]] = {}
 history_id_counter = 0
 
-# Model globals
-# Load CLIP model on startup
-print(f"Loading CLIP model '{MODEL_NAME}' on {DEVICE}...", flush=True)
-t_load_start = time.time()
-clip_processor = CLIPProcessor.from_pretrained(MODEL_NAME)
-clip_model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE)
-clip_model.eval()
-print(f"Model loaded successfully in {time.time() - t_load_start:.2f}s.", flush=True)
+# Model globals (Loaded lazily on demand, auto-unloaded on idle)
+clip_model = None
+clip_processor = None
+model_lock = asyncio.Lock()
+
+def get_or_load_model():
+    """Lazily loads the CLIP model into memory if not already loaded."""
+    global clip_model, clip_processor, LAST_ACTIVITY_TIME
+    LAST_ACTIVITY_TIME = time.time()
+    if clip_model is None or clip_processor is None:
+        print(f"[{time.strftime('%X')}] Loading CLIP model '{MODEL_NAME}' into RAM...", flush=True)
+        t0 = time.time()
+        clip_processor = CLIPProcessor.from_pretrained(MODEL_NAME)
+        clip_model = CLIPModel.from_pretrained(MODEL_NAME).to(DEVICE)
+        clip_model.eval()
+        print(f"[{time.strftime('%X')}] Model loaded successfully in {time.time() - t0:.2f}s.", flush=True)
+    return clip_processor, clip_model
+
+def unload_model_if_idle():
+    """Unloads the model from RAM to free memory if idle for IDLE_TIMEOUT_SECONDS."""
+    global clip_model, clip_processor
+    if clip_model is not None and (time.time() - LAST_ACTIVITY_TIME) >= IDLE_TIMEOUT_SECONDS:
+        print(f"[{time.strftime('%X')}] Server idle for {IDLE_TIMEOUT_SECONDS//60} mins. Freeing RAM / unloading model...", flush=True)
+        clip_model = None
+        clip_processor = None
+        gc.collect()
+        print(f"[{time.strftime('%X')}] RAM freed. Process RAM: {psutil.Process(os.getpid()).memory_info().rss / (1024*1024):.1f} MB", flush=True)
+
+async def idle_cleanup_worker():
+    """Background watchdog that periodically checks for idle timeout."""
+    while True:
+        await asyncio.sleep(30) # check every 30 seconds
+        unload_model_if_idle()
 
 def extract_tensor(out):
     if hasattr(out, 'text_embeds') and out.text_embeds is not None:
@@ -80,7 +111,12 @@ def extract_tensor(out):
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    # Pre-warm model on startup
+    get_or_load_model()
+    # Start background idle monitor
+    cleanup_task = asyncio.create_task(idle_cleanup_worker())
     yield
+    cleanup_task.cancel()
     print("Shutting down embedding server...", flush=True)
 
 app = FastAPI(
@@ -250,21 +286,22 @@ async def embed(
     # Generate Embeddings via CLIP
     t0 = time.time()
     try:
+        proc, model = get_or_load_model()
         image_vec = None
         text_vec = None
 
         if image_bytes:
             pil_img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
-            img_inputs = clip_processor(images=pil_img, return_tensors="pt").to(DEVICE)
+            img_inputs = proc(images=pil_img, return_tensors="pt").to(DEVICE)
             with torch.no_grad():
-                feat_img = extract_tensor(clip_model.get_image_features(**img_inputs))
+                feat_img = extract_tensor(model.get_image_features(**img_inputs))
                 feat_img = feat_img / feat_img.norm(dim=-1, keepdim=True)
                 image_vec = feat_img.cpu().numpy()[0]
 
         if clean_text:
-            txt_inputs = clip_processor(text=[clean_text], return_tensors="pt").to(DEVICE)
+            txt_inputs = proc(text=[clean_text], return_tensors="pt").to(DEVICE)
             with torch.no_grad():
-                feat_txt = extract_tensor(clip_model.get_text_features(**txt_inputs))
+                feat_txt = extract_tensor(model.get_text_features(**txt_inputs))
                 feat_txt = feat_txt / feat_txt.norm(dim=-1, keepdim=True)
                 text_vec = feat_txt.cpu().numpy()[0]
 
